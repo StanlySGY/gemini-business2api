@@ -230,9 +230,12 @@ class GeminiAutomation:
             self._log("error", "code input expired")
             return {"success": False, "error": "code input expired"}
 
-        self._log("info", "inputting verification code")
-        code_input.input(code, clear=True)
-        time.sleep(0.5)
+        # 尝试模拟人类输入，失败则降级到直接注入
+        self._log("info", "inputting verification code (simulated human input)")
+        if not self._simulate_human_input(code_input, code):
+            self._log("warning", "simulated input failed, fallback to direct input")
+            code_input.input(code, clear=True)
+            time.sleep(0.5)
 
         verify_btn = page.ele("css:button[jsname='XooR8e']", timeout=3)
         if verify_btn:
@@ -362,6 +365,35 @@ class GeminiAutomation:
             time.sleep(2)
         return None
 
+    def _simulate_human_input(self, element, text: str) -> bool:
+        """模拟人类输入（逐字符输入，带随机延迟）
+
+        Args:
+            element: 输入框元素
+            text: 要输入的文本
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 先点击输入框获取焦点
+            element.click()
+            time.sleep(random.uniform(0.1, 0.3))
+
+            # 逐字符输入
+            for char in text:
+                element.input(char)
+                # 随机延迟：模拟人类打字速度（50-150ms/字符）
+                time.sleep(random.uniform(0.05, 0.15))
+
+            # 输入完成后短暂停顿
+            time.sleep(random.uniform(0.2, 0.5))
+            self._log("info", "simulated human input successfully")
+            return True
+        except Exception as e:
+            self._log("warning", f"simulated input failed: {e}")
+            return False
+
     def _find_verify_button(self, page):
         """查找验证按钮（排除重新发送按钮）"""
         try:
@@ -452,11 +484,17 @@ class GeminiAutomation:
         username = f"Test{suffix}"
 
         try:
+            # 清空输入框
             username_input.click()
             time.sleep(0.2)
             username_input.clear()
-            username_input.input(username)
-            time.sleep(0.3)
+            time.sleep(0.1)
+
+            # 尝试模拟人类输入，失败则降级到直接注入
+            if not self._simulate_human_input(username_input, username):
+                self._log("warning", "simulated username input failed, fallback to direct input")
+                username_input.input(username)
+                time.sleep(0.3)
 
             buttons = page.eles("tag:button")
             submit_btn = None
