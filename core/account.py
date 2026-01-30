@@ -28,7 +28,9 @@ HTTP_ERROR_NAMES = {
     400: "参数错误",
     401: "认证错误",
     403: "权限错误",
-    429: "限流"
+    429: "限流",
+    502: "网关错误",
+    503: "服务不可用"
 }
 
 # 配额类型定义
@@ -93,11 +95,11 @@ class CooldownConfig:
     text: int
     images: int
     videos: int
+    global_cooldown: int
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    account_failure_threshold: int
     cooldowns: CooldownConfig
 
 
@@ -134,25 +136,24 @@ class AccountManager:
         self.config = config
         self.http_client = http_client
         self.user_agent = user_agent
-        self.account_failure_threshold = retry_policy.account_failure_threshold
-        # Global cooldown is defined by text cooldown.
-        self.rate_limit_cooldown_seconds = retry_policy.cooldowns.text
+        # 冷却时间配置
+        self.rate_limit_cooldown_seconds = retry_policy.cooldowns.text  # 向后兼容
         self.text_rate_limit_cooldown_seconds = retry_policy.cooldowns.text
         self.images_rate_limit_cooldown_seconds = retry_policy.cooldowns.images
         self.videos_rate_limit_cooldown_seconds = retry_policy.cooldowns.videos
+        self.global_cooldown_seconds = retry_policy.cooldowns.global_cooldown  # 新增：全局冷却
         self.jwt_manager: Optional['JWTManager'] = None  # 延迟初始化
         self.is_available = True
-        self.last_error_time = 0.0
-        self.last_cooldown_time = 0.0  # 冷却时间戳（401/403/429错误）
-        self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳 {"text": timestamp, "images": timestamp, "videos": timestamp}
-        self.error_count = 0
+        self.last_error_time = 0.0  # 保留用于统计
+        self.last_cooldown_time = 0.0  # 全局冷却时间戳
+        self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳
         self.conversation_count = 0  # 累计成功次数（用于统计展示）
         self.failure_count = 0  # 累计失败次数（用于统计展示）
         self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
 
     def handle_non_http_error(self, error_context: str = "", request_id: str = "") -> None:
         """
-        统一处理非HTTP错误（网络错误、解析错误等）
+        统一处理非HTTP错误（网络错误、解析错误等）- 极简版：只有冷却
 
         Args:
             error_context: 错误上下文（如"JWT获取"、"聊天请求"）
@@ -160,18 +161,12 @@ class AccountManager:
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
         self.last_error_time = time.time()
-        self.error_count += 1
-        if self.error_count >= self.account_failure_threshold:
-            self.is_available = False
-            logger.error(
-                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"{error_context}连续失败{self.error_count}次，账户已永久禁用"
-            )
-        else:
-            logger.warning(
-                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"{error_context}失败({self.error_count}/{self.account_failure_threshold})"
-            )
+        self.last_cooldown_time = time.time()
+        self.is_available = False
+        logger.warning(
+            f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+            f"{error_context}失败，账户将休息{self.global_cooldown_seconds}秒后自动恢复"
+        )
 
     def _get_quota_cooldown_seconds(self, quota_type: Optional[str]) -> int:
         if quota_type == "images":
@@ -182,16 +177,15 @@ class AccountManager:
 
     def apply_retry_policy(self, retry_policy: RetryPolicy) -> None:
         """Apply updated retry policy to this account manager."""
-        self.account_failure_threshold = retry_policy.account_failure_threshold
-        # Global cooldown is defined by text cooldown.
-        self.rate_limit_cooldown_seconds = retry_policy.cooldowns.text
+        self.rate_limit_cooldown_seconds = retry_policy.cooldowns.text  # 向后兼容
         self.text_rate_limit_cooldown_seconds = retry_policy.cooldowns.text
         self.images_rate_limit_cooldown_seconds = retry_policy.cooldowns.images
         self.videos_rate_limit_cooldown_seconds = retry_policy.cooldowns.videos
+        self.global_cooldown_seconds = retry_policy.cooldowns.global_cooldown  # 新增
 
     def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
         """
-        统一处理HTTP错误（参考 business-gemini-2api-main 的 raise_for_account_response）
+        统一处理HTTP错误 - 极简版：只有冷却，没有永久禁用
 
         Args:
             status_code: HTTP状态码
@@ -202,9 +196,9 @@ class AccountManager:
         处理逻辑：
             - 400: 参数错误，不计入失败（客户端问题）
             - 429 + quota_type: 按配额类型冷却（对话/绘图/视频独立冷却）
-            - 429 无quota_type: 全局冷却（整个账户不可用）
-            - 401/403: 全局冷却（认证错误）
-            - 其他HTTP错误: 计入error_count，达到阈值后永久禁用
+            - 429 无quota_type: 全局冷却
+            - 401/403: 全局冷却
+            - 502/503及其他HTTP错误: 全局冷却（新增）
         """
         req_tag = f"[req_{request_id}] " if request_id else ""
 
@@ -212,7 +206,7 @@ class AccountManager:
         if status_code == 400:
             logger.warning(
                 f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"HTTP 400参数错误（不计入失败次数）{': ' + error_detail[:100] if error_detail else ''}"
+                f"HTTP 400参数错误（不计入失败）{': ' + error_detail[:100] if error_detail else ''}"
             )
             return
 
@@ -233,39 +227,21 @@ class AccountManager:
                 self.is_available = False
                 logger.warning(
                     f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                    f"遇到429限流，账户将休息{self.rate_limit_cooldown_seconds}秒后自动恢复"
+                    f"遇到429限流，账户将休息{self.global_cooldown_seconds}秒后自动恢复"
                     f"{': ' + error_detail[:100] if error_detail else ''}"
                 )
             return
 
-        # 401/403认证错误：全局冷却
-        if status_code in (401, 403):
-            self.last_cooldown_time = time.time()
-            self.is_available = False
-            error_type = HTTP_ERROR_NAMES.get(status_code, "HTTP错误")
-            logger.warning(
-                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"遇到{status_code}{error_type}，账户将休息{self.rate_limit_cooldown_seconds}秒后自动恢复"
-                f"{': ' + error_detail[:100] if error_detail else ''}"
-            )
-            return
-
-        # 其他HTTP错误：计入error_count
+        # 401/403/502/503及其他HTTP错误：全局冷却（统一处理）
         self.last_error_time = time.time()
-        self.error_count += 1
-        if self.error_count >= self.account_failure_threshold:
-            self.is_available = False
-            logger.error(
-                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"HTTP {status_code}错误连续失败{self.error_count}次，账户已永久禁用"
-                f"{': ' + error_detail[:100] if error_detail else ''}"
-            )
-        else:
-            logger.warning(
-                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
-                f"HTTP {status_code}错误({self.error_count}/{self.account_failure_threshold})"
-                f"{': ' + error_detail[:100] if error_detail else ''}"
-            )
+        self.last_cooldown_time = time.time()
+        self.is_available = False
+        error_type = HTTP_ERROR_NAMES.get(status_code, f"HTTP {status_code}")
+        logger.warning(
+            f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+            f"遇到{error_type}错误，账户将休息{self.global_cooldown_seconds}秒后自动恢复"
+            f"{': ' + error_detail[:100] if error_detail else ''}"
+        )
 
     def is_quota_available(self, quota_type: str) -> bool:
         """检查指定配额是否可用（冷却中则不可用）。"""
@@ -286,12 +262,22 @@ class AccountManager:
         return True
 
     def are_quotas_available(self, quota_types: Optional[Iterable[str]] = None) -> bool:
-        """检查多个配额类型是否都可用。"""
+        """
+        检查多个配额类型是否都可用。
+
+        注意：如果对话配额受限，所有配额都不可用（对话是基础功能）
+        """
         if not quota_types:
             return True
         if isinstance(quota_types, str):
             quota_types = [quota_types]
-        return all(self.is_quota_available(qt) for qt in quota_types)
+
+        # 如果对话配额受限，所有配额都不可用
+        if not self.is_quota_available("text"):
+            return False
+
+        # 检查其他配额
+        return all(self.is_quota_available(qt) for qt in quota_types if qt != "text")
 
     async def get_jwt(self, request_id: str = "") -> str:
         """获取 JWT token (带错误处理)"""
@@ -308,7 +294,6 @@ class AccountManager:
                 self.jwt_manager = JWTManager(self.config, self.http_client, self.user_agent)
             jwt = await self.jwt_manager.get(request_id)
             self.is_available = True
-            self.error_count = 0
             return jwt
         except Exception as e:
             # 使用统一的错误处理入口
@@ -319,15 +304,15 @@ class AccountManager:
             raise
 
     def should_retry(self) -> bool:
-        """检查账户是否可重试（冷却期后自动恢复，普通错误永久禁用）"""
+        """检查账户是否可重试 - 极简版：只检查冷却期"""
         if self.is_available:
             return True
 
         current_time = time.time()
 
-        # 检查冷却期（401/403/429错误冷却期后自动恢复）
+        # 检查冷却期（所有错误冷却期后自动恢复）
         if self.last_cooldown_time > 0:
-            if current_time - self.last_cooldown_time > self.rate_limit_cooldown_seconds:
+            if current_time - self.last_cooldown_time > self.global_cooldown_seconds:
                 # 冷却期已过，自动恢复账户可用性
                 self.is_available = True
                 self.last_cooldown_time = 0.0
@@ -335,33 +320,25 @@ class AccountManager:
                 return True
             return False  # 仍在冷却期
 
-        # 普通错误永久禁用
+        # 如果没有冷却时间戳但账户不可用，可能是手动禁用
         return False
 
     def get_cooldown_info(self) -> tuple[int, str | None]:
-        """
-        获取账户冷却信息
-
-        Returns:
-            (cooldown_seconds, cooldown_reason) 元组
-            - cooldown_seconds: 剩余冷却秒数，0表示无冷却，-1表示永久禁用
-            - cooldown_reason: 冷却原因，None表示无冷却
-        """
+        """获取账户冷却信息"""
         current_time = time.time()
 
-        # 优先检查冷却期（无论账户是否可用）
+        # 检查冷却期
         if self.last_cooldown_time > 0:
-            remaining = self.rate_limit_cooldown_seconds - (current_time - self.last_cooldown_time)
+            remaining = self.global_cooldown_seconds - (current_time - self.last_cooldown_time)
             if remaining > 0:
-                return (int(remaining), "限流冷却")
-            # 冷却期已过
+                return (int(remaining), "全局冷却")
 
         # 如果账户可用且没有冷却，返回正常状态
         if self.is_available:
             return (0, None)
 
-        # 普通错误永久禁用
-        return (-1, "错误禁用")
+        # 账户不可用但没有冷却时间戳（可能是手动禁用）
+        return (-1, "手动禁用")
 
     def get_quota_status(self) -> Dict[str, any]:
         """
@@ -396,7 +373,9 @@ class AccountManager:
         quotas = {}
         limited_count = 0
         expired_quotas = []  # 收集已过期的配额类型
+        text_limited = False  # 对话配额是否受限
 
+        # 第一遍：检查所有配额状态
         for quota_type in QUOTA_TYPES:
             if quota_type in self.quota_cooldowns:
                 cooldown_time = self.quota_cooldowns[quota_type]
@@ -410,6 +389,9 @@ class AccountManager:
                         "remaining_seconds": remaining
                     }
                     limited_count += 1
+                    # 标记对话配额受限
+                    if quota_type == "text":
+                        text_limited = True
                 else:
                     # 冷却时间已过，标记为待删除
                     expired_quotas.append(quota_type)
@@ -421,6 +403,16 @@ class AccountManager:
         # 统一删除已过期的配额冷却
         for quota_type in expired_quotas:
             del self.quota_cooldowns[quota_type]
+
+        # 如果对话配额受限，所有配额都标记为不可用（对话是基础功能）
+        if text_limited:
+            for quota_type in QUOTA_TYPES:
+                if quota_type != "text" and quotas[quota_type].get("available", False):
+                    quotas[quota_type] = {
+                        "available": False,
+                        "reason": "对话配额受限"
+                    }
+                    limited_count += 1
 
         return {
             "quotas": quotas,
@@ -720,7 +712,6 @@ def reload_accounts(
             "is_available": account_mgr.is_available,
             "last_error_time": account_mgr.last_error_time,
             "last_cooldown_time": account_mgr.last_cooldown_time,
-            "error_count": account_mgr.error_count,
             "session_usage_count": account_mgr.session_usage_count,
             "quota_cooldowns": dict(account_mgr.quota_cooldowns),
         }
@@ -744,7 +735,6 @@ def reload_accounts(
             account_mgr.is_available = stats.get("is_available", True)
             account_mgr.last_error_time = stats.get("last_error_time", 0.0)
             account_mgr.last_cooldown_time = stats.get("last_cooldown_time", 0.0)
-            account_mgr.error_count = stats.get("error_count", 0)
             account_mgr.session_usage_count = stats.get("session_usage_count", 0)
             account_mgr.quota_cooldowns = stats.get("quota_cooldowns", {})
             logger.debug(f"[CONFIG] Account {account_id} refreshed; runtime state preserved")

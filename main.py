@@ -413,11 +413,11 @@ AUTO_REFRESH_ACCOUNTS_SECONDS = config.retry.auto_refresh_accounts_seconds
 
 def build_retry_policy() -> RetryPolicy:
     return RetryPolicy(
-        account_failure_threshold=config.retry.account_failure_threshold,
         cooldowns=CooldownConfig(
             text=config.retry.text_rate_limit_cooldown_seconds,
             images=config.retry.images_rate_limit_cooldown_seconds,
             videos=config.retry.videos_rate_limit_cooldown_seconds,
+            global_cooldown=config.retry.global_cooldown_seconds,
         ),
     )
 
@@ -1080,7 +1080,7 @@ async def admin_stats(request: Request):
         is_rate_limited = cooldown_seconds > 0 and cooldown_reason and "429" in cooldown_reason
         is_expired = config.is_expired()
         is_auto_disabled = (not account_manager.is_available) and (not config.disabled)
-        is_failed = is_auto_disabled or is_expired or cooldown_reason == "错误禁用"
+        is_failed = is_auto_disabled or is_expired
         is_active = (not is_failed) and (not config.disabled) and (not is_rate_limited)
 
         if is_rate_limited:
@@ -1183,7 +1183,6 @@ async def admin_get_accounts(request: Request):
             "remaining_hours": remaining_hours,
             "remaining_display": remaining_display,
             "is_available": account_manager.is_available,
-            "error_count": account_manager.error_count,
             "failure_count": account_manager.failure_count,
             "disabled": config.disabled,
             "cooldown_seconds": cooldown_seconds,
@@ -1374,20 +1373,20 @@ async def admin_disable_account(request: Request, account_id: str):
 @app.put("/admin/accounts/{account_id}/enable")
 @require_login()
 async def admin_enable_account(request: Request, account_id: str):
-    """启用账户（同时重置错误禁用状态）"""
+    """启用账户（同时重置冷却状态）"""
     global multi_account_mgr
     try:
         multi_account_mgr = _update_account_disabled_status(
             account_id, False, multi_account_mgr
         )
 
-        # 重置运行时错误状态（允许手动恢复错误禁用的账户）
+        # 重置运行时冷却状态（允许手动恢复冷却中的账户）
         if account_id in multi_account_mgr.accounts:
             account_mgr = multi_account_mgr.accounts[account_id]
             account_mgr.is_available = True
-            account_mgr.error_count = 0
-            account_mgr.last_429_time = 0.0
-            logger.info(f"[CONFIG] 账户 {account_id} 错误状态已重置")
+            account_mgr.last_cooldown_time = 0.0
+            account_mgr.quota_cooldowns = {}
+            logger.info(f"[CONFIG] 账户 {account_id} 冷却状态已重置")
 
         return {"status": "success", "message": f"账户 {account_id} 已启用", "account_count": len(multi_account_mgr.accounts)}
     except Exception as e:
@@ -1407,8 +1406,8 @@ async def admin_bulk_enable_accounts(request: Request, account_ids: list[str]):
         if account_id in multi_account_mgr.accounts:
             account_mgr = multi_account_mgr.accounts[account_id]
             account_mgr.is_available = True
-            account_mgr.error_count = 0
-            account_mgr.last_429_time = 0.0
+            account_mgr.last_cooldown_time = 0.0
+            account_mgr.quota_cooldowns = {}
     return {"status": "success", "success_count": success_count, "errors": errors}
 
 @app.put("/admin/accounts/bulk-disable")
@@ -1466,10 +1465,10 @@ async def admin_get_settings(request: Request):
             "max_new_session_tries": config.retry.max_new_session_tries,
             "max_request_retries": config.retry.max_request_retries,
             "max_account_switch_tries": config.retry.max_account_switch_tries,
-            "account_failure_threshold": config.retry.account_failure_threshold,
             "text_rate_limit_cooldown_seconds": config.retry.text_rate_limit_cooldown_seconds,
             "images_rate_limit_cooldown_seconds": config.retry.images_rate_limit_cooldown_seconds,
             "videos_rate_limit_cooldown_seconds": config.retry.videos_rate_limit_cooldown_seconds,
+            "global_cooldown_seconds": config.retry.global_cooldown_seconds,
             "session_cache_ttl_seconds": config.retry.session_cache_ttl_seconds,
             "auto_refresh_accounts_seconds": config.retry.auto_refresh_accounts_seconds,
             "scheduled_refresh_enabled": config.retry.scheduled_refresh_enabled,
@@ -1549,10 +1548,10 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         old_proxy_for_auth = PROXY_FOR_AUTH
         old_proxy_for_chat = PROXY_FOR_CHAT
         old_retry_config = {
-            "account_failure_threshold": RETRY_POLICY.account_failure_threshold,
             "text_rate_limit_cooldown_seconds": RETRY_POLICY.cooldowns.text,
             "images_rate_limit_cooldown_seconds": RETRY_POLICY.cooldowns.images,
             "videos_rate_limit_cooldown_seconds": RETRY_POLICY.cooldowns.videos,
+            "global_cooldown_seconds": RETRY_POLICY.cooldowns.global_cooldown,
             "session_cache_ttl_seconds": SESSION_CACHE_TTL_SECONDS
         }
 
@@ -1642,10 +1641,10 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
 
         # 检查是否需要更新账户管理器配置（重试策略变化）
         retry_changed = (
-            old_retry_config["account_failure_threshold"] != RETRY_POLICY.account_failure_threshold or
             old_retry_config["text_rate_limit_cooldown_seconds"] != RETRY_POLICY.cooldowns.text or
             old_retry_config["images_rate_limit_cooldown_seconds"] != RETRY_POLICY.cooldowns.images or
             old_retry_config["videos_rate_limit_cooldown_seconds"] != RETRY_POLICY.cooldowns.videos or
+            old_retry_config["global_cooldown_seconds"] != RETRY_POLICY.cooldowns.global_cooldown or
             old_retry_config["session_cache_ttl_seconds"] != SESSION_CACHE_TTL_SECONDS
         )
 
@@ -2098,14 +2097,11 @@ async def chat_impl(
                     yield chunk
 
                 if getattr(request.state, "first_response_time", None) is None:
-                    account_manager.handle_non_http_error("空响应", request_id)
-                    uptime_tracker.record_request("account_pool", False, status_code=502)
-                    await finalize_result("error", 502, "Empty response")
-                    return
+                    # 空响应应该触发重试逻辑，抛出异常让下面的 except 块处理
+                    raise HTTPException(status_code=502, detail="Empty response from upstream")
 
-                # 请求成功，重置账户失败计数
+                # 请求成功，账户保持可用
                 account_manager.is_available = True
-                account_manager.error_count = 0
                 account_manager.conversation_count += 1  # 增加成功次数
 
                 # 记录账号池状态（请求成功）
