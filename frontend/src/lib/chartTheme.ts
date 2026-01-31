@@ -15,22 +15,46 @@ export const chartColors = {
   slate: '#64748b',
   gray: '#94a3b8',
   lightGreen: '#4ade80',
+  cyan: '#22d3ee',
+  emerald: '#34d399',
 }
 
 // 模型专用色板
 export const modelColors: Record<string, string> = {
   'gemini-3-pro-preview': chartColors.primary,
-  'gemini-2.5-pro': chartColors.success,
+  'gemini-2.5-pro': chartColors.cyan,
   'gemini-2.5-flash': chartColors.warning,
   'gemini-3-flash-preview': chartColors.pink,
-  'gemini-imagen': '#34d399',
-  'gemini-veo': '#22d3ee',
+  'gemini-imagen': chartColors.emerald,
+  'gemini-veo': chartColors.success,
   'gemini-auto': chartColors.slate,
 }
+
+// 有效模型列表
+export const validModels = [
+  'gemini-auto',
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-3-flash-preview',
+  'gemini-3-pro-preview',
+  'gemini-imagen',
+  'gemini-veo',
+]
 
 // 获取模型颜色（带回退）
 export function getModelColor(model: string): string {
   return modelColors[model] || chartColors.gray
+}
+
+// 过滤有效模型
+export function filterValidModels(modelRequests: Record<string, number[]>): Record<string, number[]> {
+  const filtered: Record<string, number[]> = {}
+  validModels.forEach(model => {
+    if (modelRequests[model]) {
+      filtered[model] = modelRequests[model]
+    }
+  })
+  return filtered
 }
 
 // 文本样式
@@ -145,12 +169,12 @@ export function getPieChartTheme(isMobile = false) {
       }
     : {
         left: 0,
-        top: 'center',
+        top: 'middle',
         orient: 'vertical' as const,
       }
 
-  const pieCenter = isMobile ? ['50%', '38%'] : ['66%', '50%']
-  const pieRadius = isMobile ? ['40%', '62%'] : ['52%', '78%']
+  const pieCenter = isMobile ? ['50%', '42%'] : ['60%', '50%']
+  const pieRadius = isMobile ? ['35%', '55%'] : ['45%', '70%']
 
   return {
     animation: true,
@@ -165,6 +189,8 @@ export function getPieChartTheme(isMobile = false) {
     legend: {
       ...legendConfig,
       ...legendPosition,
+      type: isMobile ? 'scroll' : 'plain',
+      pageIconSize: 10,
     },
     series: {
       type: 'pie',
@@ -180,6 +206,7 @@ export function getPieChartTheme(isMobile = false) {
         color: '#6b6b6b',
       },
       labelLine: {
+        show: true,
         length: 12,
         length2: 10,
         lineStyle: {
@@ -189,7 +216,14 @@ export function getPieChartTheme(isMobile = false) {
       itemStyle: {
         borderWidth: 2,
         borderColor: '#fff',
-        borderRadius: 10,
+        borderRadius: 8,
+      },
+      emphasis: {
+        label: {
+          show: true,
+          fontSize: 13,
+          fontWeight: 'bold',
+        },
       },
     },
   }
@@ -208,6 +242,10 @@ export function createLineSeries(
     areaOpacity?: number
     lineWidth?: number
     zIndex?: number
+    lineStyle?: {
+      type?: 'solid' | 'dashed' | 'dotted'
+      width?: number
+    }
   }
 ) {
   const {
@@ -216,6 +254,7 @@ export function createLineSeries(
     areaOpacity = 0.25,
     lineWidth = 2,
     zIndex = 1,
+    lineStyle,
   } = options || {}
 
   return {
@@ -225,7 +264,8 @@ export function createLineSeries(
     smooth,
     showSymbol,
     lineStyle: {
-      width: lineWidth,
+      width: lineStyle?.width ?? lineWidth,
+      ...(lineStyle?.type && { type: lineStyle.type }),
     },
     areaStyle: {
       opacity: areaOpacity,

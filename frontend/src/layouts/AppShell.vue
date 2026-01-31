@@ -379,18 +379,18 @@ const currentPageTitle = computed(() => {
 
 const navItemClass = (path: string) => {
   const baseLayout = isSidebarCollapsed.value ? 'px-2 justify-center gap-0' : 'px-3 gap-3'
-  const base = `transition-colors ${baseLayout}`
+  const base = `transition-all ${baseLayout}`
   if (route.path === path) {
-    return `${base} bg-primary text-primary-foreground`
+    return `${base} bg-accent text-foreground`
   }
-  return `${base} text-muted-foreground hover:bg-accent hover:text-accent-foreground`
+  return `${base} text-muted-foreground hover:bg-accent/50 hover:text-foreground`
 }
 
 const navIconClass = (path: string) => {
   if (route.path === path) {
-    return 'bg-primary-foreground/15 text-primary-foreground border-primary-foreground/40'
+    return 'bg-primary/15 text-primary border-primary/30'
   }
-  return 'bg-secondary text-muted-foreground group-hover:text-accent-foreground'
+  return 'bg-secondary text-muted-foreground group-hover:text-foreground group-hover:border-primary/20'
 }
 
 
